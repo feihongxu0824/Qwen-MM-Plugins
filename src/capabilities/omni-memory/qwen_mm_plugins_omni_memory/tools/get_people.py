@@ -4,7 +4,7 @@ from typing import Any
 
 from shared.content import json_text
 
-from ..service import load_store, memory_label, utterances
+from ..service import load_store, memory_label, memory_read, utterances
 from . import MemoryRef
 
 
@@ -15,6 +15,7 @@ class GetPeopleArgs(MemoryRef):
 TOOL = {"name": "get_people", "args": GetPeopleArgs}
 
 
+@memory_read
 def get_people(
     video_path: str | None = None, namespace: str | None = None, person_id: str | None = None
 ) -> dict[str, Any]:

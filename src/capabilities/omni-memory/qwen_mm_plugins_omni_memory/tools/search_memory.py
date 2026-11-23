@@ -6,23 +6,29 @@ from pydantic import Field
 
 from shared.content import json_text
 
-from ..service import embed_client, load_store, memory_label, moment_brief
-from . import MemoryRef
+from ..service import embed_client, load_store, memory_label, memory_read, moment_brief
+from . import MemoryFilter, MemoryRef
 
 
 class SearchMemoryArgs(MemoryRef):
     query: str
+    filters: MemoryFilter | None = None
     top_k: int = Field(default=5, ge=1, le=20)
 
 
 TOOL = {"name": "search_memory", "args": SearchMemoryArgs}
 
 
+@memory_read
 def search_memory(
-    video_path: str | None = None, namespace: str | None = None, query: str = "", top_k: int = 5
+    video_path: str | None = None,
+    namespace: str | None = None,
+    query: str = "",
+    top_k: int = 5,
+    filters: dict | None = None,
 ) -> dict[str, Any]:
     store = load_store(video_path, namespace)
-    hits = store.search(query, client=embed_client(), k=max(1, min(int(top_k), 20)))
+    hits = store.search(query, client=embed_client(), k=max(1, min(int(top_k), 20)), filters=filters)
     return {
         "label": memory_label(video_path, namespace),
         "mode": hits.get("mode"),
@@ -49,5 +55,6 @@ def handle(arguments: dict[str, Any]) -> list[dict[str, str]]:
             memory is read from the configured shared root.
         query: Descriptive statement of what you are looking for, not a question.
         top_k: Maximum number of matching results to return.
+        filters: Optional hard constraints, applied before retrieval and to all expanded results.
     """
     return [json_text(search_memory(**arguments))]

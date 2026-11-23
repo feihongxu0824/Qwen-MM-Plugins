@@ -213,7 +213,15 @@ def slice_video(
 
 
 def build_one(
-    video: Path, mode: str, namespace: str | None, window: int, step: int, height: int, rollup_k: int, max_clips: int
+    video: Path,
+    mode: str,
+    namespace: str | None,
+    window: int,
+    step: int,
+    height: int,
+    rollup_k: int,
+    max_clips: int,
+    retrieval_backend: str | None = None,
 ) -> dict:
     # The backend lays a memory out as <root>/<ns>/{store.json,meta.json,clips/}. Two
     # layouts, matching what the query tools accept (service.memory_dir):
@@ -230,11 +238,20 @@ def build_one(
     else:
         mdir = memory_dir(video)
         root, ns = mdir.parent, mdir.name
-    mdir.mkdir(parents=True, exist_ok=True)
     # Load-bearing for the default layout, where root is the VIDEO's directory: this is the only way
     # storage.get_backend() learns it. Removing it would root every per-video build at MEM_LOCAL_DIR.
     os.environ["MEM_LOCAL_DIR"] = str(root)
-    backend = storage.get_backend()
+    backend = storage.get_backend(root)
+    # Validate before creating anything: a namespace remains one directory component.
+    mdir = Path(backend._ns_dir(ns))
+    with backend.writer(ns):
+        return _build_one_locked(
+            video, mode, window, step, height, rollup_k, max_clips, retrieval_backend, backend, ns, mdir
+        )
+
+
+def _build_one_locked(video, mode, window, step, height, rollup_k, max_clips, requested_backend, backend, ns, mdir):
+    """The lock covers reading old state, slicing, ingestion and the final async flush."""
 
     existing = ns in backend.list_namespaces()
     if existing and mode == "new":
@@ -248,6 +265,10 @@ def build_one(
     if mode == "append" and not existing:
         mode = "new"  # nothing to append to yet — this video starts the timeline
 
+    descriptor = backend.load(ns).storage if existing and mode in {"append", "resume"} else None
+    selected = storage.select_retrieval_backend(requested_backend, descriptor)
+    storage.preflight_retrieval_backend(selected)
+
     clips_root, plan = slice_video(video, mdir, window, step, height, max_clips)
 
     if mode == "resume":
@@ -260,8 +281,20 @@ def build_one(
             have = {o.get("idx") for o in backend.load(ns).episodic}
             done = sum(1 for c in plan if c["idx"] in have)
             if done >= len(plan):
+                # Explicit backend selection also applies to an already complete video.
+                current = backend.load(ns)
+                if requested_backend is not None:
+                    current.storage = {"backend": selected}
+                    current.storage = backend.save_final_async(ns, current).result()
                 print(f"[BUILD] {ns}: this video is already complete ({done}/{len(plan)})", flush=True)
-                return {"namespace": ns, "status": "complete", "episodic": done, "planned": len(plan)}
+                return {
+                    "namespace": ns,
+                    "status": "complete",
+                    "episodic": done,
+                    "planned": len(plan),
+                    "retrieval_backend": selected,
+                    "dense_ok": current.dense_ok,
+                }
             print(f"[BUILD] {ns}: resuming at clip {done}/{len(plan)} — {len(plan) - done} to go", flush=True)
 
     # Completeness baseline. append: store.episodic keeps growing across videos, so add what was
@@ -283,6 +316,9 @@ def build_one(
         overwrite=(mode == "rebuild"),
         clips_dir=str(clips_root),
         resume=(mode == "resume"),
+        retrieval_backend=selected,
+        backend=backend,
+        writer_locked=True,
     ):
         if st is not None:
             store = st
@@ -344,6 +380,13 @@ def main() -> int:
     ap.add_argument("--height", type=int, default=480, help="Clip height")
     ap.add_argument("--rollup-k", type=int, default=10, help="Clips per stage-2 induction batch")
     ap.add_argument("--max-clips", type=int, default=0, help="0 = whole video; small value = smoke test")
+    ap.add_argument(
+        "--retrieval-backend",
+        choices=("json", "zvec"),
+        default=None,
+        help="json: existing retrieval; zvec: persistent indexes. Default: json for new/rebuild, "
+        "inherit the existing backend for append/resume. Install the omni-memory-zvec extra for zvec.",
+    )
     ap.add_argument(
         "-j", "--concurrency", type=int, default=1, help="Videos in parallel. Each video is serial internally."
     )
@@ -417,6 +460,7 @@ def main() -> int:
         height=a.height,
         rollup_k=a.rollup_k,
         max_clips=a.max_clips,
+        retrieval_backend=a.retrieval_backend,
     )
 
     results = []

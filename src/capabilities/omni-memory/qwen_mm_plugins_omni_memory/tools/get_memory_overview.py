@@ -4,7 +4,7 @@ from typing import Any
 
 from shared.content import json_text
 
-from ..service import load_store, memory_label
+from ..service import load_store, memory_label, memory_read
 from . import MemoryRef
 
 
@@ -15,6 +15,7 @@ class GetMemoryOverviewArgs(MemoryRef):
 TOOL = {"name": "get_memory_overview", "args": GetMemoryOverviewArgs}
 
 
+@memory_read
 def overview(video_path: str | None = None, namespace: str | None = None) -> dict[str, Any]:
     """The vocabulary a retrieval plan is written from.
 

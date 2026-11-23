@@ -10,12 +10,7 @@ import re
 import numpy as np
 
 from .omni_core import NAME_STOP
-
-BM25_K1 = 1.5  # term-frequency saturation
-
-BM25_B = 0.75  # document-length normalisation
-
-BM25_BOOST = 2.0  # weight on the entity-name field
+from .retrieval_text import BM25_B, BM25_BOOST, BM25_K1, kw, tok_list, toks  # noqa: F401
 
 
 def soundex(s):
@@ -88,71 +83,6 @@ def phonetic_name_match(a, b):
 
 
 # ============================================================ RETRIEVAL HELPERS
-def toks(s):
-    return set(re.findall(r"[a-z0-9']+|[一-鿿]", str(s or "").lower()))
-
-
-_STOP = {
-    "the",
-    "a",
-    "an",
-    "is",
-    "are",
-    "was",
-    "were",
-    "of",
-    "to",
-    "in",
-    "on",
-    "at",
-    "and",
-    "or",
-    "do",
-    "does",
-    "did",
-    "you",
-    "i",
-    "he",
-    "she",
-    "it",
-    "they",
-    "we",
-    "this",
-    "that",
-    "what",
-    "who",
-    "which",
-    "how",
-    "when",
-    "where",
-    "why",
-    "please",
-    "hmm",
-    "um",
-    "uh",
-    "的",
-    "了",
-    "是",
-    "在",
-    "吗",
-    "呢",
-    "我",
-    "你",
-    "他",
-    "她",
-    "它",
-}
-
-
-def kw(s):
-    return {t for t in toks(s) if t not in _STOP}
-
-
-def tok_list(s):
-    """Tokens WITH their repeats — BM25 scores on term frequency, which toks() discards."""
-    return [t for t in re.findall(r"[a-z0-9']+|[一-鿿]", str(s or "").lower()) if t not in _STOP]
-
-
 def cosine(a, b):
     a = np.asarray(a, dtype="float32")
     b = np.asarray(b, dtype="float32")

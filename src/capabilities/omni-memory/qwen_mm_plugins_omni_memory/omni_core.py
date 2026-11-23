@@ -488,6 +488,9 @@ class StoreBase:
         self.processed_sec = 0.0  # total video seconds ingested so far (global time offset)
         self.dense_ok = False
         self.name_ledger = {}  # streaming name-alignment evidence ledger (bounded; see NAME ALIGN)
+        self.storage = {}
+        self.embedding_model = None
+        self.extra = {}
         self._by_id = {}
         self._by_name = {}
 
@@ -516,6 +519,24 @@ class StoreBase:
         s.processed_sec = float(d.get("processed_sec", 0) or 0)
         s.dense_ok = bool(d.get("dense_ok", False))
         s.name_ledger = d.get("name_ledger", {}) or {}  # v3+; older libs → {} (back-compat)
+        s.storage = dict(d.get("storage") or {})
+        s.embedding_model = d.get("embedding_model")
+        known = {
+            "version",
+            "scene_env",
+            "entities",
+            "episodic",
+            "semantic",
+            "clips",
+            "driver_state",
+            "processed_sec",
+            "dense_ok",
+            "name_ledger",
+            "storage",
+            "embedding_model",
+            "retrieval",
+        }
+        s.extra = {k: v for k, v in d.items() if k not in known}
         return s
 
     # ---------- text extraction from a composite record ----------

@@ -8,7 +8,11 @@ are defined once for both.
 Nothing on this side ranks, searches or answers — a build only ever appends and re-indexes.
 """
 
+import copy
+
 import numpy as np
+from env_config import embed_config
+from memory_query import SOURCE_KEYS, text_hash
 from omni_core import EMB_DTYPE, StoreBase, emb_encode, embed_texts, get_embed_client
 
 
@@ -71,44 +75,74 @@ class MemoryStore(StoreBase):
         self.__init__()
 
     def snapshot_for_async(self):
-        """Cheap, race-safe snapshot for BACKGROUND serialization (per-clip incremental save).
-        Only shallow per-dict copies: isolates top-level in-place mutations that happen after
-        this returns — driver update_state (entity fields) and build_index (adds 'emb'). Nested
-        parsed/raw/state_after are shared (never mutated after a clip is created). The heavy
-        json.dumps is done off-thread by the caller, so the main loop pays only these copies.
-
-        _emb_out does the per-dict copy for the two containers that hold vectors, encoding them on the
-        way out — the caller's json.dumps cannot serialize an ndarray, so this is also what keeps a
-        snapshot serializable at all."""
-        return {
-            "version": 3,
-            "scene_env": list(self.scene_env),
-            "entities": [dict(e) for e in self.entities],
-            "episodic": [_emb_out(r) for r in self.episodic],
-            "semantic": [_emb_out(t) for t in self.semantic],
-            "clips": [dict(c) for c in self.clips],
-            "driver_state": self.driver_state,
-            "processed_sec": self.processed_sec,
-            "dense_ok": self.dense_ok,
-            "name_ledger": dict(self.name_ledger),
-        }
+        """Freeze a serializable snapshot, including nested text that name alignment can change."""
+        return copy.deepcopy(
+            {
+                **self.extra,
+                "version": 4,
+                "storage": dict(self.storage),
+                "embedding_model": self.embedding_model,
+                "scene_env": list(self.scene_env),
+                "entities": [dict(e) for e in self.entities],
+                "episodic": [_emb_out(r) for r in self.episodic],
+                "semantic": [_emb_out(t) for t in self.semantic],
+                "clips": [dict(c) for c in self.clips],
+                "driver_state": self.driver_state,
+                "processed_sec": self.processed_sec,
+                "dense_ok": self.dense_ok,
+                "name_ledger": dict(self.name_ledger),
+            }
+        )
 
     # ---------- dense index ----------
+    @classmethod
+    def from_dict(cls, data):
+        store = super().from_dict(data)
+        store._embedding_cache = {}
+        for pool, source in SOURCE_KEYS.items():
+            for record in getattr(store, source):
+                if record.get("emb") is not None:
+                    fingerprint = record.get("emb_text_hash") or text_hash(pool, record)
+                    record["emb_text_hash"] = fingerprint
+                    identity = record.get("idx" if pool == "episodes" else "key")
+                    store._embedding_cache[(pool, identity)] = (fingerprint, record["emb"])
+        return store
+
     def build_index(self, client):
-        """Embed for dense retrieval. Episodic is INCREMENTAL (only clips missing 'emb' —
-        cheap for multi-upload); semantic is re-embedded fully (statements change via CRUD)."""
-        ec = get_embed_client()  # embeddings ALWAYS DashScope, regardless of the chat client
-        # `is None`, not falsiness: a vector is an ndarray in memory, and bool() on one with more than
-        # a single element raises rather than answering.
-        ep_need = [e for e in self.episodic if e.get("emb") is None]
-        ep_vecs = embed_texts(ec, [self._ep_text(e) for e in ep_need]) if ep_need else []
-        sem_vecs = embed_texts(ec, [f.get("statement", "") for f in self.semantic]) if self.semantic else []
-        if ep_vecs is None or sem_vecs is None:
+        """Reuse unchanged vectors; never retain an embedding after its input text changes."""
+        model = embed_config()[1]
+        retained = [r for source in SOURCE_KEYS.values() for r in getattr(self, source) if r.get("emb") is not None]
+        if retained and self.embedding_model is not None and self.embedding_model != model:
+            self.dense_ok = False
+            raise ValueError("embedding model changed; rebuild explicitly before mixing vectors")
+        known_model = self.embedding_model
+        cache = getattr(self, "_embedding_cache", {})
+        needs = []
+        for pool, source in SOURCE_KEYS.items():
+            for record in getattr(self, source):
+                fingerprint = text_hash(pool, record)
+                identity = record.get("idx" if pool == "episodes" else "key")
+                cached = cache.get((pool, identity))
+                old_hash = record.get("emb_text_hash")
+                if record.get("emb") is not None and old_hash is not None and old_hash != fingerprint:
+                    record["emb"] = None
+                if record.get("emb") is None and cached and cached[0] == fingerprint:
+                    record["emb"] = cached[1]
+                if record.get("emb") is None:
+                    text = self._ep_text(record) if pool == "episodes" else record.get("statement") or ""
+                    needs.append((pool, identity, record, fingerprint, text))
+                else:
+                    record["emb_text_hash"] = fingerprint
+        vectors = embed_texts(get_embed_client(), [entry[4] for entry in needs]) if needs else []
+        if vectors is None or len(vectors) != len(needs):
             self.dense_ok = False
             return False
-        for e, v in zip(ep_need, ep_vecs):
-            e["emb"] = np.asarray(v, dtype=EMB_DTYPE)
-        for f, v in zip(self.semantic, sem_vecs):
-            f["emb"] = np.asarray(v, dtype=EMB_DTYPE)
+        for (pool, identity, record, fingerprint, _), vector in zip(needs, vectors):
+            record["emb"] = np.asarray(vector, dtype=EMB_DTYPE)
+            record["emb_text_hash"] = fingerprint
+            cache[(pool, identity)] = (fingerprint, record["emb"])
+        self._embedding_cache = cache
+        if not retained or known_model == model:
+            self.embedding_model = model
         self.dense_ok = True
         return True

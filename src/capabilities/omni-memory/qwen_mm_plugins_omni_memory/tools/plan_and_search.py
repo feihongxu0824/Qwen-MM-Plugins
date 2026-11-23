@@ -6,12 +6,13 @@ from pydantic import Field
 
 from shared.content import json_text
 
-from ..service import embed_client, load_store, memory_label, moment_brief
-from . import MemoryRef
+from ..service import embed_client, load_store, memory_label, memory_read, moment_brief
+from . import MemoryFilter, MemoryRef
 
 
 class PlanAndSearchArgs(MemoryRef):
     question: str = ""
+    filters: MemoryFilter | None = None
     people: list[str] | None = None
     fact_keys: list[str] | None = None
     queries: list[str] | None = None
@@ -23,6 +24,7 @@ class PlanAndSearchArgs(MemoryRef):
 TOOL = {"name": "plan_and_search", "args": PlanAndSearchArgs}
 
 
+@memory_read
 def plan_and_search(
     video_path: str | None = None,
     namespace: str | None = None,
@@ -33,6 +35,7 @@ def plan_and_search(
     time_ranges: list[list[float]] | None = None,
     include_scene: bool = False,
     top_k: int = 5,
+    filters: dict | None = None,
 ) -> dict[str, Any]:
     """Execute a retrieval plan the CALLER decided on, fusing the containers in one call.
 
@@ -56,7 +59,9 @@ def plan_and_search(
         "episode_queries": episode_queries,
         "time_ranges": [list(t) for t in (time_ranges or [])],
     }
-    hits = store.run_plan(plan, question or " ".join(episode_queries), client=embed_client(), k=max(1, int(top_k)))
+    hits = store.run_plan(
+        plan, question or " ".join(episode_queries), client=embed_client(), k=max(1, int(top_k)), filters=filters
+    )
     replays = [c for c in (hits.get("replays") or []) if c]
     return {
         "label": memory_label(video_path, namespace),
@@ -66,6 +71,7 @@ def plan_and_search(
             "queries": episode_queries,
             "time_ranges": [list(t) for t in (time_ranges or [])],
             "include_scene": bool(include_scene),
+            **({"filters": filters} if filters else {}),
         },
         "people": [
             {"person_id": e.get("person_id"), "name": e.get("name"), "appearance": (e.get("appearance") or "")[:120]}
@@ -113,5 +119,6 @@ def handle(arguments: dict[str, Any]) -> list[dict[str, str]]:
             the room' questions — it is off by default because recalling scene for every question
             measured net-negative, so it is a deliberate pick rather than a freebie.
         top_k: Maximum number of matching results to return.
+        filters: Optional hard constraints, applied before retrieval and to all expanded results.
     """
     return [json_text(plan_and_search(**arguments))]

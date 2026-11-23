@@ -7,7 +7,8 @@ from typing import Any
 from shared.content import json_text
 
 from .. import config, watch
-from ..service import library_namespaces, memory_dir, memory_label
+from ..memory_io import read_snapshot
+from ..service import library_namespaces, memory_dir, memory_label, memory_read
 from . import MemoryRef
 
 
@@ -23,7 +24,7 @@ _CLIP_DIRNAME = "clips"
 
 def _quick_info(mdir: Path) -> dict[str, Any]:
     """Cheap header read — avoids hydrating the whole store just to list it."""
-    d = json.loads((mdir / "store.json").read_text(encoding="utf-8"))
+    d = read_snapshot(mdir)
     ep = d.get("episodic") or []
     ents = d.get("entities") or []
     return {
@@ -86,6 +87,7 @@ def _planned_clip_count(mdir: Path) -> int | None:
     return total or None
 
 
+@memory_read
 def memory_status(video_path: str | None = None, namespace: str | None = None) -> dict[str, Any]:
     """Existence + metadata + INTEGRITY check.
 

@@ -8,10 +8,11 @@ as a standalone program. Answering off the video itself is watch.py; the matchin
 text_match.py.
 """
 
-import math
 import time
 
 from . import config
+from .memory_backend import JsonBackend
+from .memory_query import Predicate, Selection, select
 from .omni_core import (
     NAME_STOP,
     RESIDENT_ENTITY_CAP,
@@ -27,12 +28,10 @@ from .text_match import (
     BM25_B,
     BM25_BOOST,
     BM25_K1,
-    cosine,
     kw,
     phonetic_name_match,
     query_person_names,
     rrf,
-    tok_list,
 )
 from .watch import REPLAY_N
 
@@ -50,7 +49,7 @@ class MemoryStore(StoreBase):
         """Resident directory of semantic KEYS only. Under the buffer cap keep ALL (insertion
         order); over the cap keep the most frequently/recently used (freq×recency)."""
         cap = RESIDENT_KEY_CAP if limit is None else limit
-        active = [t for t in self.semantic if t.get("key") and t.get("status") != "superseded"]
+        active = self.records("facts", Selection().where(Predicate("status", "ne", "superseded")))
         if len(active) > cap:
             active = sorted(active, key=lambda t: (t.get("freq", 0), t.get("last_used", 0)), reverse=True)[:cap]
         return [t.get("key") for t in active]
@@ -163,17 +162,39 @@ class MemoryStore(StoreBase):
     def get_entity(self, name_or_id):
         return self._by_id.get(name_or_id) or self._by_name.get(str(name_or_id).lower())
 
+    @property
+    def backend(self):
+        if not hasattr(self, "_backend"):
+            self._backend = JsonBackend({"episodic": self.episodic, "semantic": self.semantic})
+        return self._backend
+
+    def records(self, pool, selection=Selection()):
+        source = self.episodic if pool == "episodes" else self.semantic
+        return [source[f["ordinal"]] for f in self.backend.scan(pool, selection)]
+
+    def restrict(self, pool, records, selection):
+        if not selection.clauses:
+            return records
+        allowed = {id(r) for r in self.records(pool, selection)}
+        return [r for r in records if id(r) in allowed]
+
     def triples_of(self, subject_id):
-        return [
-            t
-            for t in self.semantic
-            if t.get("subject_id") == subject_id or (t.get("subject") or "").lower() == str(subject_id).lower()
-        ]
+        return self.records(
+            "facts",
+            Selection().where(
+                Predicate("subject_id", "eq", subject_id),
+                Predicate("subject", "eq", str(subject_id).lower()),
+            ),
+        )
+
+    def facts_by_prefix(self, prefixes):
+        return self.records("facts", Selection().where(*(Predicate("key", "prefix", p) for p in prefixes)))
 
     def get_triples_by_keys(self, keys):
-        """On-demand recall of triples by key (plan picks keys from the resident directory)."""
-        kset = set(keys or [])
-        return [t for t in self.semantic if t.get("key") in kset and t.get("status") != "superseded"]
+        return self.records(
+            "facts",
+            Selection().where(Predicate("key", "in", tuple(keys or []))).where(Predicate("status", "ne", "superseded")),
+        )
 
     def recall_scene_env(self, query, k=SCENE_RECALL_N):
         """① on-demand scene recall: return the top-k scene_env items most relevant to the query
@@ -186,260 +207,162 @@ class MemoryStore(StoreBase):
         return (hit or list(self.scene_env))[:k]
 
     def episodic_in_time(self, start, end):
-        return [o for o in self.episodic if o.get("win_end", 0) >= start and o.get("win_start", 1e18) <= end]
+        return self.records("episodes", select({"start_sec": start, "end_sec": end}))
 
     def episodic_of_entity(self, person_id):
-        out = []
-        for o in self.episodic:
-            p = o.get("parsed") or {}
-            vids = [e.get("person_id") for e in (p.get("visual", {}) or {}).get("key_entities", []) or []]
-            sids = [u.get("speaker_id") for u in (p.get("audio", {}) or {}).get("utterances", []) or []]
-            if person_id in vids or person_id in sids:
-                out.append(o)
-        return out
+        return self.records("episodes", select({"person_ids": [person_id]}))
+
+    def dialogue_rows(self, filters=None):
+        return self.backend.scan("utterances", select(filters, "utterances"))
+
+    def _rank(self, pool, query, qvec, k, selection=Selection()):
+        limit = max(500, 5 * k)
+        lists = [
+            self.backend.sparse(
+                pool,
+                query,
+                selection,
+                k1=config.get_float_env("MEM_BM25_K1", BM25_K1, min_value=0),
+                b=config.get_float_env("MEM_BM25_B", BM25_B, min_value=0, max_value=1),
+                boost=config.get_float_env("MEM_BM25_BOOST", BM25_BOOST, min_value=0),
+                limit=limit,
+            )
+        ]
+        if qvec is not None:
+            lists.append(self.backend.dense(pool, qvec, selection, limit=limit))
+        scores = rrf(lists)
+        order = sorted(scores, key=lambda i: (-scores[i], i))[:k]
+        source = self.episodic if pool == "episodes" else self.semantic
+        return [source[i] for i in order]
+
+    def _query_vector(self, query, client):
+        if not self.dense_ok:
+            return None
+        client = client or get_embed_client()
+        if client is not None and self.embedding_model and self.embedding_model != config.embed_config()[1]:
+            raise ValueError("query embedding model differs from this memory; use its model or rebuild")
+        v = embed_texts(client, [query])
+        return v[0] if v else None
 
     @staticmethod
-    def _ep_entity_text(rec):
-        p = rec.get("parsed") or {}
-        vis = p.get("visual", {}) or {}
-        names = []
-        for e in vis.get("key_entities", []) or []:
-            names.append(" ".join(filter(None, [e.get("name"), e.get("ref")])))
-        return " ".join(names)
+    def _filters(filters):
+        if hasattr(filters, "model_dump"):
+            filters = filters.model_dump(exclude_none=True)
+        filters = filters or {}
+        if filters.keys() - {"episodes", "facts"}:
+            raise ValueError("filters must contain episodes and/or facts")
+        return select(filters.get("episodes")), select(filters.get("facts"), "facts")
 
-    def _dense_rank(self, items, qvec):
-        # `is not None` for the same reason as build_index: these are ndarrays now.
-        scored = [(i, cosine(qvec, it["emb"])) for i, it in enumerate(items) if it.get("emb") is not None]
-        return [i for i, _ in sorted(scored, key=lambda x: -x[1])]
+    def _restrict_people(self, people, episode_selection, fact_selection):
+        if episode_selection.clauses:
+            allowed = set()
+            for row in self.backend.scan("episodes", episode_selection):
+                allowed.update(row["person_ids"])
+            people = [e for e in people if e.get("person_id") in allowed]
+        elif fact_selection.clauses:
+            allowed = {r["subject_id"] for r in self.backend.scan("facts", fact_selection)}
+            people = [e for e in people if e.get("person_id") in allowed]
+        return people
 
-    def _sparse_rank(self, items, query, textfn, boostfn=None):
-        """BM25 over `items`, returning their indices best-first; items matching nothing are omitted.
-
-        Rare terms carry more weight (idf), repeats saturate rather than accumulate (k1), and length is
-        normalised against the collection average (b) — without which long clip transcripts drift to
-        the top merely for holding more distinct words.
-
-        `boostfn` names a second, much shorter field (the clip's entity names), scored as its own BM25
-        against its own average length and added with weight BM25_BOOST rather than folded into the
-        main text, so a name hit is not diluted by the transcript's length.
-
-        Statistics come from the collection actually passed in, so the same record scores differently
-        depending on what it is ranked against — correct, since idf is a property of the collection.
-        """
-        k1 = config.get_float_env("MEM_BM25_K1", BM25_K1, min_value=0)
-        b = config.get_float_env("MEM_BM25_B", BM25_B, min_value=0, max_value=1)
-        boost = config.get_float_env("MEM_BM25_BOOST", BM25_BOOST, min_value=0)
-        qterms = kw(query)
-        if not qterms or not items:
-            return []
-
-        def field(fn):
-            """(per-doc term-frequency, per-doc length, doc-frequency of each query term, avg length)"""
-            tfs, lens, df = [], [], {}
-            for it in items:
-                toks = tok_list(fn(it))
-                tf = {}
-                for t in toks:
-                    tf[t] = tf.get(t, 0) + 1
-                tfs.append(tf)
-                lens.append(len(toks))
-                for t in qterms & tf.keys():
-                    df[t] = df.get(t, 0) + 1
-            n = len(items)
-            return tfs, lens, df, (sum(lens) / n if n else 0.0) or 1.0
-
-        def bm25(tfs, lens, df, avgdl, weight):
-            n = len(items)
-            # Robertson/Sparck-Jones idf with the +1 guard, so a term in every document scores ~0
-            # rather than going negative.
-            idf = {t: math.log(1 + (n - c + 0.5) / (c + 0.5)) for t, c in df.items()}
-            out = [0.0] * n
-            for i, (tf, dl) in enumerate(zip(tfs, lens)):
-                s = 0.0
-                for t, w in idf.items():
-                    f = tf.get(t, 0)
-                    if f:
-                        s += w * f * (k1 + 1) / (f + k1 * (1 - b + b * dl / avgdl))
-                if s:
-                    out[i] = s * weight
-            return out
-
-        scores = bm25(*field(textfn), 1.0)
-        if boostfn:
-            for i, s in enumerate(bm25(*field(boostfn), boost)):
-                scores[i] += s
-        ranked = [(i, s) for i, s in enumerate(scores) if s > 0]
-        return [i for i, _ in sorted(ranked, key=lambda x: -x[1])]
-
-    # ---------- hybrid search + entity-anchored multi-hop ----------
-    def search(self, query, client=None, k=5):
-        """Returns {'entities','semantic','episodic','mode'}. Hybrid RRF per pool, plus:
-        if the query names a known entity, enrich with its triples + episodic mentions."""
-        qvec = None
-        if self.dense_ok:
-            v = embed_texts(client or get_embed_client(), [query])
-            qvec = v[0] if v else None
-        mode = "hybrid" if qvec is not None else "keyword"
-
-        def fuse(items, textfn, boostfn=None):
-            if not items:
-                return []
-            lists = []
-            sp = self._sparse_rank(items, query, textfn, boostfn)
-            if sp:
-                lists.append(sp)
-            if qvec is not None:
-                lists.append(self._dense_rank(items, qvec))
-            if not lists:
-                return []
-            fused = rrf(lists)
-            order = sorted(fused, key=lambda i: -fused[i])
-            return [items[i] for i in order[:k]]
-
-        ep = fuse(self.episodic, self._ep_text, boostfn=self._ep_entity_text)
-        sem = fuse(self.semantic, lambda f: f.get("statement", ""))
-
-        # entity-anchored multi-hop (cross-modal): matched entity → its triples + episodic mentions
+    def search(self, query, client=None, k=5, filters=None):
+        ep_sel, fact_sel = self._filters(filters)
+        qvec = self._query_vector(query, client)
+        ep = self._rank("episodes", query, qvec, k, ep_sel)
+        sem = self._rank("facts", query, qvec, k, fact_sel)
         qk = kw(query)
         matched = [e for e in self.entities if qk & (kw(e.get("name")) | kw(e.get("appearance")) | kw(e.get("ref")))]
-        for e in matched:
-            pid = e.get("person_id")
-            for t in self.triples_of(pid):
-                if t not in sem:
-                    sem.append(t)
-            for o in self.episodic_of_entity(pid)[:k]:
-                if o not in ep:
-                    ep.append(o)
+        matched = self._restrict_people(matched, ep_sel, fact_sel)
+        for entity in matched:
+            for fact in self.restrict("facts", self.triples_of(entity.get("person_id")), fact_sel):
+                if not any(fact is r for r in sem):
+                    sem.append(fact)
+            related = self.restrict("episodes", self.episodic_of_entity(entity.get("person_id")), ep_sel)
+            for episode in related[:k]:
+                if not any(episode is r for r in ep):
+                    ep.append(episode)
+        if not ep and not sem and not matched:
+            ep = self.records("episodes", ep_sel)[:k]
+            sem = self.records("facts", fact_sel)[:k]
+        return {
+            "entities": matched,
+            "semantic": sem,
+            "episodic": ep,
+            "mode": "hybrid" if qvec is not None else "keyword",
+        }
 
-        if not ep and not sem and not matched:  # nothing matched — fall back to a broad recall
-            ep, sem = self.episodic[:k], self.semantic[:k]
-        diag(
-            f"[MEM] ▸ SEARCH q={query!r} mode={mode} -> entities={len(matched)} semantic={len(sem)} episodic={len(ep)}",
-            flush=True,
+    def search_episodic(self, query, client=None, k=5, filters=None, selection=None):
+        selected = selection if selection is not None else select(filters)
+        return self._rank("episodes", query, self._query_vector(query, client), k, selected)
+
+    def search_semantic(self, query, client=None, k=5, filters=None):
+        selected = select(filters, "facts").where(Predicate("status", "ne", "superseded"))
+        return self._rank("facts", query, self._query_vector(query, client), k, selected)
+
+    def search_dialogue(self, query, client=None, k=8, filters=None):
+        rows = self.dialogue_rows(filters)
+        selection = Selection().where(Predicate("idx", "in", tuple(sorted({f["clip_idx"] for f in rows}))))
+        episodes = (
+            self.search_episodic(query, client, k, selection=selection)
+            if filters
+            else self.search_episodic(query, client, k)
         )
-        return {"entities": matched, "semantic": sem, "episodic": ep, "mode": mode}
-
-    def search_episodic(self, query, client=None, k=5):
-        """Episodic-only hybrid recall (dense+keyword RRF); keyword-only if no client/index."""
-        if not self.episodic:
-            return []
-        qvec = None
-        if self.dense_ok:
-            v = embed_texts(client or get_embed_client(), [query])
-            qvec = v[0] if v else None
-        lists = []
-        sp = self._sparse_rank(self.episodic, query, self._ep_text, boostfn=self._ep_entity_text)
-        if sp:
-            lists.append(sp)
-        if qvec is not None:
-            lists.append(self._dense_rank(self.episodic, qvec))
-        if not lists:
-            return []
-        fused = rrf(lists)
-        order = sorted(fused, key=lambda i: -fused[i])
-        return [self.episodic[i] for i in order[:k]]
-
-    def search_semantic(self, query, client=None, k=5):
-        """Semantic-only hybrid recall (dense+keyword RRF) — the counterpart to search_episodic.
-
-        Used when a plan names no fact keys: the caller has a question but does not know which keys
-        exist, so match on statement content instead of by exact key.
-        """
-        active = [t for t in (self.semantic or []) if t.get("status") != "superseded"]
-        if not active:
-            return []
-        qvec = None
-        if self.dense_ok:
-            v = embed_texts(client or get_embed_client(), [query])
-            qvec = v[0] if v else None
-        lists = []
-        sp = self._sparse_rank(active, query, lambda t: t.get("statement", "") or "")
-        if sp:
-            lists.append(sp)
-        if qvec is not None:
-            lists.append(self._dense_rank(active, qvec))
-        if not lists:
-            return []
-        fused = rrf(lists)
-        order = sorted(fused, key=lambda i: -fused[i])
-        return [active[i] for i in order[:k]]
+        chosen = {e.get("idx") for e in episodes}
+        return episodes, [row for row in rows if row["clip_idx"] in chosen]
 
     def rerank_episodic(self, cands, query, k=None, client=None):
-        """S2: re-score accumulated candidates against the ORIGINAL question (not the decomposed
-        episode_queries) via dense+keyword RRF, keep top-k. Restores cross-subquery comparability
-        and trims episodic noise. Returns re-ranked (relevance order)."""
-        if k is None:
-            k = config.get_int_env("MEM_EP_TOPN", EP_TOPN, min_value=1)
-        if not cands or len(cands) <= k:
+        k = k or config.get_int_env("MEM_EP_TOPN", EP_TOPN, min_value=1)
+        if len(cands) <= k:
             return cands
-        lists = []
-        sp = self._sparse_rank(cands, query, self._ep_text, boostfn=self._ep_entity_text)
-        if sp:
-            lists.append(sp)
-        if self.dense_ok:
-            v = embed_texts(client or get_embed_client(), [query])
-            if v:
-                lists.append(self._dense_rank(cands, v[0]))
-        if not lists:
-            return cands[:k]
-        fused = rrf(lists)
-        order = sorted(fused, key=lambda i: -fused[i])
-        return [cands[i] for i in order[:k]]
+        selection = Selection().where(Predicate("idx", "in", tuple(e["idx"] for e in cands)))
+        ranked = self.search_episodic(query, client, k, selection=selection)
+        return ranked or cands[:k]
 
-    def run_plan(self, plan, query, client=None, k=5):
-        """Execute a retrieval plan -> hits. Consumes entities + keys + episode_queries + time_ranges."""
-        _keys = list(plan.get("need_keys") or [])
-        want_scene = "SCENE_ENV" in _keys or bool(plan.get("need_scene"))  # ① on-demand scene key
-        _keys = [x for x in _keys if x != "SCENE_ENV"]  # not a semantic triple key
+    def run_plan(self, plan, query, client=None, k=5, filters=None):
+        ep_sel, fact_sel = self._filters(filters)
+        keys = list(plan.get("need_keys") or [])
+        want_scene = "SCENE_ENV" in keys or bool(plan.get("need_scene"))
+        sem = self.get_triples_by_keys([x for x in keys if x != "SCENE_ENV"])
         ents = [e for e in (self.get_entity(x) for x in (plan.get("need_entities") or [])) if e]
-        # Exact lookup by design: whoever wrote the plan was shown the complete key directory
-        # (entity_directory + semantic_key_directory, the same thing resident_context renders), so
-        # guessing keys here would only add facts it chose not to ask for. Matching facts by content
-        # is search_semantic, which search_facts exposes as its own tool.
-        sem = self.get_triples_by_keys(_keys)
-        if config.get_bool_env("MEM_PHONETIC_FALLBACK", True):  # ③ recover mis-heard names by sound
+        if config.get_bool_env("MEM_PHONETIC_FALLBACK", True):
             ents, sem = self._augment_phonetic(ents, sem, query)
-        _t = time.time()  # P4: frequency/recency instrumentation
-        for it in ents + sem:
-            it["freq"] = it.get("freq", 0) + 1
-            it["last_used"] = _t
+        ents = self._restrict_people(ents, ep_sel, fact_sel)
+        sem = self.restrict("facts", sem, fact_sel)
+        for item in ents + sem:
+            item["freq"] = item.get("freq", 0) + 1
+            item["last_used"] = time.time()
         queries = list(plan.get("episode_queries") or [])
-        if not queries and not sem and not ents and not plan.get("time_ranges"):
-            queries = [query]
         if query not in queries:
             queries.append(query)
         scene = self.recall_scene_env(" ".join(queries) or query) if want_scene else []
         ep, seen = [], set()
         for q in queries:
-            for o in self.search_episodic(q, client=client, k=k):
-                if o.get("idx") not in seen:
-                    seen.add(o.get("idx"))
-                    ep.append(o)
-        for tr in plan.get("time_ranges") or []:  # P2: time-range recall
+            for item in self.search_episodic(q, client, k, selection=ep_sel):
+                if item["idx"] not in seen:
+                    seen.add(item["idx"])
+                    ep.append(item)
+        for tr in plan.get("time_ranges") or []:
             try:
-                s, e = float(tr[0]), float(tr[1])
-            except Exception:
+                start, end = float(tr[0]), float(tr[1])
+            except (ValueError, TypeError, IndexError):
                 continue
-            for o in self.episodic_in_time(s, e):
-                if o.get("idx") not in seen:
-                    seen.add(o.get("idx"))
-                    ep.append(o)
-        if config.get_bool_env("MEM_EP_RERANK"):  # S2: rerank vs original query + trim noise
+            for item in self.restrict("episodes", self.episodic_in_time(start, end), ep_sel):
+                if item["idx"] not in seen:
+                    seen.add(item["idx"])
+                    ep.append(item)
+        if config.get_bool_env("MEM_EP_RERANK"):
             ep = self.rerank_episodic(ep, query, client=client)
-        ranked = list(ep)  # relevance/recall order (for replay pick)
-        ep.sort(key=lambda o: o.get("win_start", 0))  # chronological order (for answer evidence)
-        replays = self._resolve_replays(plan, ranked, sem)  # multi-anchor candidates (deferred)
-        diag(
-            f"[MEM] ▸ RUN_PLAN entities={len(ents)} semantic={len(sem)} episodic={len(ep)} "
-            f"scene={len(scene)} replays={[c.get('idx') for c in replays]}",
-            flush=True,
-        )
+        replays = self._resolve_replays(plan, list(ep), sem)
+        # Replay fallback must not escape a hard episode restriction.
+        if ep_sel.clauses:
+            eligible = {r["idx"] for r in self.backend.scan("episodes", ep_sel)}
+            replays = [c for c in replays if c.get("idx") in eligible]
+        ep.sort(key=lambda item: item.get("win_start", 0))
         return {
             "entities": ents,
             "semantic": sem,
             "episodic": ep,
             "scene": scene,
-            "replay": (replays[0] if replays else None),
+            "replay": replays[0] if replays else None,
             "replays": replays,
             "mode": "plan",
         }

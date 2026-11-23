@@ -6,7 +6,7 @@ from pydantic import Field
 
 from shared.content import json_text
 
-from ..service import load_store, memory_label, moment_brief
+from ..service import load_store, memory_label, memory_read, moment_brief
 from . import MemoryRef
 
 
@@ -18,6 +18,7 @@ class GetTimelineArgs(MemoryRef):
 TOOL = {"name": "get_timeline", "args": GetTimelineArgs}
 
 
+@memory_read
 def get_timeline(
     video_path: str | None = None, namespace: str | None = None, start_sec: float = 0, end_sec: float = 0
 ) -> dict[str, Any]:

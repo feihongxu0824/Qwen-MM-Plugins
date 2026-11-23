@@ -7,12 +7,14 @@ from pydantic import Field
 
 from shared.content import json_text
 
-from ..service import embed_client, load_store, memory_label
-from . import MemoryRef
+from ..memory_query import Predicate, select
+from ..service import embed_client, load_store, memory_label, memory_read
+from . import FactFilter, MemoryRef
 
 
 class SearchFactsArgs(MemoryRef):
     query: str | None = None
+    filters: FactFilter | None = None
     key_prefix: str | None = None
     subject_id: str | None = None
     top_k: int = Field(default=10, ge=1, le=20)
@@ -40,16 +42,11 @@ def _facts_by_prefix(store, key_prefix: str) -> tuple[list, str]:
     other = store.name_of(head) if re.fullmatch(r"P\d+", head) else (store.get_entity(head) or {}).get("person_id")
     if other:
         forms.append(pref.replace(head, str(other), 1))
-    seen, out = set(), []
-    for f in forms:
-        for t in store.semantic or []:
-            k = str(t.get("key", ""))
-            if k.startswith(f) and k not in seen:
-                seen.add(k)
-                out.append(t)
+    out = store.facts_by_prefix(list(dict.fromkeys(forms)))
     return out, "key_prefix=" + "|".join(dict.fromkeys(forms))
 
 
+@memory_read
 def search_facts(
     video_path: str | None = None,
     namespace: str | None = None,
@@ -57,6 +54,7 @@ def search_facts(
     key_prefix: str | None = None,
     subject_id: str | None = None,
     top_k: int = 10,
+    filters: dict | None = None,
 ) -> dict[str, Any]:
     """Three entry points into the semantic container: by subject, by key prefix, or by search."""
     store = load_store(video_path, namespace)
@@ -68,13 +66,17 @@ def search_facts(
     elif query:
         # search_semantic rather than the full store.search(): the latter fuses episodic as well and
         # the result is thrown away here.
-        triples = store.search_semantic(query, client=embed_client(), k=max(1, min(int(top_k), 20)))
+        triples = store.search_semantic(query, client=embed_client(), k=max(1, min(int(top_k), 20)), filters=filters)
         how = f"query={query!r}"
+    elif filters is not None:
+        triples = store.records("facts", select(filters, "facts").where(Predicate("status", "ne", "superseded")))
+        how = "filters"
     else:
         return {
-            "error": "pass one of: query, key_prefix, subject_id",
+            "error": "pass one of: query, key_prefix, subject_id, filters",
             "key_directory": store.semantic_key_directory() or [],
         }
+    triples = store.restrict("facts", triples, select(filters, "facts"))
     return {
         "label": memory_label(video_path, namespace),
         "how": how,
@@ -108,5 +110,6 @@ def handle(arguments: dict[str, Any]) -> list[dict[str, str]]:
             get_memory_overview for the full key directory.
         subject_id: All facts whose subject is this person_id.
         top_k: Maximum number of matching results to return.
+        filters: Optional hard constraints, applied before retrieval and to all expanded results.
     """
     return [json_text(search_facts(**arguments))]
