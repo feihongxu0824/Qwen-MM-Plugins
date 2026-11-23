@@ -110,6 +110,12 @@ Paths above are relative to this Skill directory. Everything the build needs is 
 `script/build_memory/` — it imports nothing from the MCP server's package, so it runs the same whether
 that package is installed or not.
 
+Storage defaults to JSON. For zvec, install the optional
+`qwen-mm-plugins[omni-memory-zvec]` dependency in both the builder and MCP environments, then add
+`--retrieval-backend zvec`. Append/resume inherit the stored backend. Migrate an existing memory with
+`python3 script/build_memory/reindex_memory.py MEMORY_DIR --backend json|zvec`; back up the whole
+memory directory, including `zvec/`. Both backends support the search tools' optional `filters`.
+
 ### Streaming several videos into one memory
 
 Give the same `--namespace` to several videos and they become **one continuous memory**:

@@ -5,7 +5,7 @@ from typing import Any
 
 from shared.content import json_text
 
-from ..service import load_store, memory_label
+from ..service import load_store, memory_label, memory_read
 from . import MemoryRef
 
 
@@ -16,6 +16,7 @@ class GetMomentArgs(MemoryRef):
 TOOL = {"name": "get_moment", "args": GetMomentArgs}
 
 
+@memory_read
 def get_moment(
     video_path: str | None = None, namespace: str | None = None, idxs: list[int] | None = None
 ) -> dict[str, Any]:

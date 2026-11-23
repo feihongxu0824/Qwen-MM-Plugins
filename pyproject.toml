@@ -67,6 +67,7 @@ viz = [
 video-spatio = ["numpy<3", "scipy", "matplotlib", "opencv-python-headless"]
 video-memory = ["numpy<3", "requests", "zvec>=0.8,<1"]  # long-video graph-memory server
 omni-memory = ["numpy<3"]                     # long-video audio-visual memory server (openai client is a base dep)
+omni-memory-zvec = ["qwen-mm-plugins[omni-memory]", "zvec>=0.8.1,<1"]
 omni-video2note = ["reportlab", "pydantic>=2.11", "pypdfium2"]  # local tutorial video to audited illustrated PDF
 omnidr = ["requests[socks]", "pypdfium2", "yt-dlp>=2026.8.19", "playwright"]
 video-edit = ["dashscope>=1.25.16", "requests"]  # image/video/audio generation server

@@ -8,7 +8,7 @@ from typing import Any
 from shared.content import json_text
 
 from .. import config, watch
-from ..service import load_store, memory_label
+from ..service import load_store, memory_label, memory_read
 from . import MemoryRef
 
 # Replay sends clips inline as base64 (~3.5 MB per 30s clip), so an unbounded selection turns into a
@@ -26,6 +26,7 @@ class ReplayAndAnswerArgs(MemoryRef):
 TOOL = {"name": "replay_and_answer", "args": ReplayAndAnswerArgs}
 
 
+@memory_read
 def replay_and_answer(
     video_path: str | None = None,
     namespace: str | None = None,
@@ -47,7 +48,7 @@ def replay_and_answer(
     Clips go inline as base64, ~3.5 MB per 30s clip, so the request grows fast. Beyond REPLAY_CAP the
     extra clips are dropped and reported in `dropped_idxs` rather than silently truncated.
     """
-    from . import mem_core as _mc  # local import: only the replay path needs the omni client
+    from ..omni_core import get_client
 
     store = load_store(video_path, namespace)
     by_idx = {c.get("idx"): c for c in (store.clips or [])}
@@ -75,7 +76,7 @@ def replay_and_answer(
         }
     used_model = model or config.chat_config()[1]
     out = ""
-    for out in _mc.replay_answer_stream(_mc.get_client(), uris, evidence, question, model_override=model):
+    for out in watch.replay_answer_stream(get_client(), uris, evidence, question, model_override=model):
         pass
     res = {
         "label": memory_label(video_path, namespace),

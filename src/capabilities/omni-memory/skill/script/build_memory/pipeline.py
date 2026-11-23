@@ -7,9 +7,11 @@ memory back does not come through here at all — that is service.py.
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 import clipping
 import omni_core
@@ -64,6 +66,9 @@ def build_memory(
     overwrite=False,
     clips_dir=None,
     resume=False,
+    retrieval_backend=None,
+    backend=None,
+    writer_locked=False,
 ):
     """Own the scratch directory, and delete it however the build ends.
 
@@ -79,24 +84,34 @@ def build_memory(
     aborted build can lose one, which get_moment and the replay planner already tolerate — they check
     the file is there before offering it.
     """
-    tmp_dir = tempfile.mkdtemp(prefix="ommem_")
-    try:
-        yield from _build_memory(
-            video,
-            window_sec,
-            step_sec,
-            max_clips,
-            rollup_k,
-            do_consolidate,
-            height,
-            namespace,
-            overwrite=overwrite,
-            clips_dir=clips_dir,
-            resume=resume,
-            tmp_dir=tmp_dir,
-        )
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    backend = backend or storage.get_backend()
+    namespace = (namespace or "").strip() or time.strftime("run-%Y%m%d-%H%M%S")
+    with nullcontext() if writer_locked else backend.writer(namespace):
+        tmp_dir = tempfile.mkdtemp(prefix="ommem_")
+        try:
+            yield from _build_memory(
+                video,
+                window_sec,
+                step_sec,
+                max_clips,
+                rollup_k,
+                do_consolidate,
+                height,
+                namespace,
+                overwrite=overwrite,
+                clips_dir=clips_dir,
+                resume=resume,
+                tmp_dir=tmp_dir,
+                retrieval_backend=retrieval_backend,
+                backend=backend,
+            )
+        finally:
+            # Uploads use this scratch directory. Even cancellation must finish queued copies
+            # before deleting their source, and before the outer builder releases its lock.
+            try:
+                backend.drain(raise_errors=sys.exc_info()[0] is None)
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _build_memory(
@@ -112,6 +127,8 @@ def _build_memory(
     clips_dir=None,
     resume=False,
     tmp_dir=None,
+    retrieval_backend=None,
+    backend=None,
 ):
     """Generator: sliding clips → sequential stateful extract → stage-2 → index → save.
     Yields (status, build_log, mem_view, state).
@@ -142,7 +159,7 @@ def _build_memory(
       · timing summary
     """
     log = []
-    backend = storage.get_backend()
+    backend = backend or storage.get_backend()
 
     def emit(status):
         # Slots 2 and 3 are legacy placeholders; callers read only `status` and `store`.
@@ -174,6 +191,9 @@ def _build_memory(
             return
     else:
         store = MemoryStore()
+    selected = storage.select_retrieval_backend(retrieval_backend, store.storage)
+    storage.preflight_retrieval_backend(selected)
+    store.storage = {"backend": selected}
     # resume stays on the SAME timeline, so nothing is shifted; append starts a new segment.
     offset = store.time_offset() if append else 0.0
     idx_offset = store.clip_idx_next() if append else 0
@@ -339,8 +359,8 @@ def _build_memory(
     # starting over. `emb` is dropped on the way in because stage2_finalize serializes this store into
     # its merge prompt, where a vector is ~22 KB of decimal text the model was never asked to read
     # (measured across 10 libraries: 813 KB → 13 KB). Over the context limit the call raises and the
-    # caller keeps the unmerged triples, silently skipping the final dedup. Nothing is lost: build_index
-    # re-embeds every semantic triple at the end of the run. Dropping it is also required, not just
+    # caller keeps the unmerged triples, silently skipping the final dedup. build_index reuses unchanged
+    # vectors from its cache and embeds changed triples. Dropping it is also required, not just
     # cheaper — an in-memory vector is an ndarray, which the json deep-copy below cannot serialize.
     sem_store = (
         {
@@ -584,6 +604,7 @@ def _build_memory(
             f"🔢 向量索引已建（{t_idx}s，混合检索：向量 + 关键词 RRF）。" if ok else "🔢 向量不可用，退回关键词检索。"
         )
     except Exception as e:
+        store.dense_ok = False
         t_idx = round(time.time() - t_i0, 1)
         log.append(f"🔢 向量索引失败（退回关键词）：{str(e)[:120]}")
     hb_exec.shutdown(wait=False)
@@ -593,14 +614,25 @@ def _build_memory(
     if oss_on:
         t_o0 = time.time()
         try:
-            fut = backend.save_async(ns, store)  # queued after all incremental saves (single worker)
+            fut = backend.save_final_async(ns, store)  # queued after all incremental saves (single worker)
             if fut:
-                fut.result(timeout=120)  # wait for the final, most-complete snapshot
+                # Index construction can legitimately exceed the old JSON-only timeout. Keep
+                # yielding progress without releasing the writer lock or abandoning the future.
+                while True:
+                    try:
+                        store.storage = fut.result(timeout=5)
+                        break
+                    except TimeoutError:
+                        if fut.done():
+                            raise
+                        yield emit("💾 正在保存最终记忆和检索索引…")
             t_oss = round(time.time() - t_o0, 1)
             log.append(f"💾 已持久化到记忆库 **{ns}**（增量+异步，最终 flush {t_oss}s；重启后可加载/切换）。")
         except Exception as e:
             t_oss = round(time.time() - t_o0, 1)
             log.append(f"💾 最终保存失败（记忆仍在会话内）：{str(e)[:160]}")
+            yield emit("⚠️ 最终保存或检索索引构建失败；请检查日志并重试。")
+            raise
     else:
         log.append(f"💾 {backend.status_line()}")
 

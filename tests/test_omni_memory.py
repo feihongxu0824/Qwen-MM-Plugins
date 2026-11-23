@@ -302,6 +302,11 @@ _BUILD_MODULES = (
     "stages",
     "storage",
     "store_writer",
+    "memory_query",
+    "memory_backend",
+    "memory_io",
+    "zvec_backend",
+    "retrieval_text",
 )
 
 

@@ -16,13 +16,16 @@ Memory location, either form:
 
 from __future__ import annotations
 
-import json
+import inspect
 import os
 import threading
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 from . import config, mem_core, omni_core
+from .memory_backend import open_backend
+from .memory_io import memory_lock, read_snapshot
 
 
 def _environment_tuning_names(environment) -> tuple[str, ...]:
@@ -38,7 +41,7 @@ ENV_TUNING = _environment_tuning_names(os.environ)
 MEMORY_SUFFIX = ".memory"
 DEFAULT_OMNI_MODEL = omni_core.MODEL  # what an unspecified `model` resolves to, for tool descriptions
 
-_stores: dict[str, tuple[float, Any]] = {}  # path → (mtime, MemoryStore)
+_stores: dict[str, tuple[tuple[int, int, int], Any]] = {}  # path → (file signature, MemoryStore)
 _lock = threading.Lock()
 _tl = threading.local()
 
@@ -79,23 +82,52 @@ def library_namespaces() -> list[str]:
 
 
 def load_store(video_path: str | None = None, namespace: str | None = None):
-    """Load (and cache) a MemoryStore. Cache is invalidated by store.json mtime."""
-    mdir = memory_dir(video_path, namespace)
-    sp = mdir / "store.json"
-    if not sp.is_file():
-        raise FileNotFoundError(
-            f"no memory at {mdir} — build it first: python3 script/build_memory/build_memory.py <video>"
-        )
-    mt = sp.stat().st_mtime
-    key = str(sp)
-    with _lock:
-        hit = _stores.get(key)
-        if hit and hit[0] == mt:
-            return hit[1]
-    store = mem_core.MemoryStore.from_dict(json.loads(sp.read_text(encoding="utf-8")))
-    with _lock:
-        _stores[key] = (mt, store)
-    return store
+    """Cache business records; backend handles live only within a tool's read transaction."""
+    directory = memory_dir(video_path, namespace)
+    path = directory / "store.json"
+    if not path.is_file() and not (directory / ".memory-commit.json").is_file():
+        raise FileNotFoundError(f"no memory at {directory} — build it first")
+    with memory_lock(directory):
+        if path.is_file() and not (directory / ".memory-commit.json").is_file():
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+            with _lock:
+                hit = _stores.get(str(path))
+                if hit and hit[0] == signature:
+                    return hit[1]
+        snapshot = read_snapshot(directory)
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        key = str(path)
+        with _lock:
+            hit = _stores.get(key)
+            if hit and hit[0] == signature:
+                return hit[1]
+            store = mem_core.MemoryStore.from_dict(snapshot)
+            store._backend = open_backend(directory, snapshot)
+            _stores[key] = (signature, store)
+            return store
+
+
+def memory_read(function):
+    """Keep JSON and all native reads at one committed revision for the entire public operation."""
+    signature = inspect.signature(function)
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        directory = memory_dir(bound.arguments.get("video_path"), bound.arguments.get("namespace"))
+        if not (directory / "store.json").is_file() and not (directory / ".memory-commit.json").is_file():
+            return function(*args, **kwargs)
+        with memory_lock(directory):
+            store = load_store(bound.arguments.get("video_path"), bound.arguments.get("namespace"))
+            try:
+                store.backend.validate()
+                return function(*args, **kwargs)
+            finally:
+                store.backend.close()
+
+    return wrapped
 
 
 def preload() -> None:
@@ -154,16 +186,14 @@ def utterances(
     store, person_id: str | None = None, start_sec: float | None = None, end_sec: float | None = None
 ) -> list[dict]:
     """Every utterance in the video, optionally filtered by speaker and/or time window."""
-    out = []
-    for rec in store.episodic or []:
-        for u in clip_utterances(store, rec):
-            if person_id and u["speaker_id"] != person_id:
-                continue
-            if start_sec is not None and u["start_sec"] < start_sec:
-                continue
-            if end_sec is not None and u["start_sec"] > end_sec:
-                continue
-            out.append(u)
+    filters = {}
+    if person_id:
+        filters["speaker_ids"] = [person_id]
+    if start_sec is not None:
+        filters["start_sec"] = start_sec
+    if end_sec is not None:
+        filters["end_sec"] = end_sec
+    out = dialogue_from_rows(store, store.dialogue_rows(filters))
     out.sort(key=lambda x: (x["start_sec"], x["clip_idx"] or 0))
     return out
 
@@ -184,3 +214,22 @@ def moment_brief(store, rec: dict) -> dict[str, Any]:
         "utterance_count": len(utt),
         "first_line": (utt[0].get("text") if utt else None),
     }
+
+
+def dialogue_from_rows(store, rows):
+    out = []
+    for row in rows:
+        rec = store.episodic[row["episode_ordinal"]]
+        u = rec["parsed"]["audio"]["utterances"][row["utterance_index"]]
+        sid = u.get("speaker_id")
+        out.append(
+            {
+                "clip_idx": rec.get("idx"),
+                "start_sec": round(row["start_sec"], 1),
+                "speaker_id": sid,
+                "speaker_name": store.name_of(sid) if sid else None,
+                "text": u.get("text") or "",
+                "paralinguistic": u.get("paralinguistic") or None,
+            }
+        )
+    return out

@@ -1,7 +1,8 @@
 """Storage backend: local filesystem.
 
 A memory library is a namespace laid out as:
-    <root>/<ns>/store.json   (full MemoryStore.to_dict, incl. vectors)
+    <root>/<ns>/store.json   (business records and backend/version metadata)
+    <root>/<ns>/zvec/        (optional episodes/facts/utterances collections, including vectors)
     <root>/<ns>/meta.json    (light preview for listing / ns_info)
     <root>/<ns>/clips/win_NNN.mp4   (original-resolution clips for replay)
 
@@ -11,14 +12,30 @@ list_namespaces, meta, delete, clip_key, upload_clip_async, download_by_key.
 Memories are stored on local disk, next to the video by default.
 """
 
-import json
 import os
 import shutil
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import env_config as config
+from memory_io import atomic_json, commit_snapshot, memory_lock, read_snapshot
 from store_writer import MemoryStore
+
+
+def select_retrieval_backend(requested, descriptor=None):
+    selected = requested or (descriptor or {}).get("backend", "json")
+    if selected not in {"json", "zvec"}:
+        raise ValueError(f"unsupported memory backend: {selected}")
+    return selected
+
+
+def preflight_retrieval_backend(backend):
+    if backend == "zvec":
+        from zvec_backend import require_zvec
+
+        require_zvec()
 
 
 class _LocalBackend:
@@ -27,6 +44,34 @@ class _LocalBackend:
     def __init__(self, root):
         self.root = root
         self._exec = None
+        self._pending = []
+
+    def _submit(self, function, *args):
+        future = self._ex().submit(function, *args)
+        self._pending.append(future)
+        return future
+
+    def drain(self, *, raise_errors=True):
+        if self._exec is not None:
+            self._exec.shutdown(wait=True)
+            self._exec = None
+        pending, self._pending = self._pending, []
+        errors = []
+        for future in pending:
+            try:
+                future.result()
+            except Exception as exc:
+                errors.append(exc)
+        if errors and raise_errors:
+            raise errors[0]
+
+    @contextmanager
+    def writer(self, ns):
+        with memory_lock(self._ns_dir(ns), ".writer.lock", blocking=False):
+            try:
+                yield
+            finally:
+                self.drain(raise_errors=sys.exc_info()[0] is None)
 
     def _ex(self):
         if self._exec is None:
@@ -63,35 +108,21 @@ class _LocalBackend:
             m.update(extra)
         return m
 
-    @staticmethod
-    def _dump_atomic(path, obj):
-        """Write JSON via a temp file + rename, which is atomic within a directory.
-
-        A build snapshots after every clip and runs for tens of minutes, so a Ctrl-C, kill or OOM
-        lands in the middle of a write more often than one would think. Writing in place would leave
-        a truncated store.json that no longer loads — taking resume down with it.
-        """
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-
     def _write(self, ns, sd, meta):
         d = self._ns_dir(ns)
         os.makedirs(os.path.join(d, "clips"), exist_ok=True)
-        self._dump_atomic(os.path.join(d, "store.json"), sd)
-        self._dump_atomic(os.path.join(d, "meta.json"), self._meta_dict(ns, sd, meta))
-        return d
+        descriptor = commit_snapshot(d, sd)
+        atomic_json(os.path.join(d, "meta.json"), self._meta_dict(ns, sd, meta))
+        return descriptor
 
     def save_async(self, ns, store, meta=None):
-        snap = store.snapshot_for_async()  # cheap race-safe snapshot on the caller thread
-        return self._ex().submit(self._write, ns, snap, meta)
+        snap = store.snapshot_for_async()  # freeze before submitting to the worker
+        return self._submit(self._write, ns, snap, meta)
+
+    save_final_async = save_async
 
     def load(self, ns):
-        with open(os.path.join(self._ns_dir(ns), "store.json"), encoding="utf-8") as f:
-            return MemoryStore.from_dict(json.load(f))
+        return MemoryStore.from_dict(read_snapshot(self._ns_dir(ns), include_vectors=True))
 
     def list_namespaces(self):
         if not os.path.isdir(self.root):
@@ -104,7 +135,7 @@ class _LocalBackend:
     def upload_clip_async(self, ns, idx, path):
         dst = self.clip_key(ns, idx)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        return self._ex().submit(shutil.copyfile, path, dst)
+        return self._submit(shutil.copyfile, path, dst)
 
     def download_by_key(self, key):
         with open(key, "rb") as f:
@@ -114,9 +145,11 @@ class _LocalBackend:
 _LOCAL = None
 
 
-def get_backend():
+def get_backend(root=None):
     """Return the local-filesystem backend, rebuilt when config.local_dir() changes."""
     global _LOCAL
+    if root is not None:
+        return _LocalBackend(str(root))
     if _LOCAL is None or _LOCAL.root != config.local_dir():
         _LOCAL = _LocalBackend(config.local_dir())
     return _LOCAL

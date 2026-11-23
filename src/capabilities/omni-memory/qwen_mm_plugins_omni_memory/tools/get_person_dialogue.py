@@ -6,7 +6,7 @@ from pydantic import Field
 
 from shared.content import json_text
 
-from ..service import load_store, memory_label, utterances
+from ..service import load_store, memory_label, memory_read, utterances
 from . import MemoryRef
 
 
@@ -20,6 +20,7 @@ class GetPersonDialogueArgs(MemoryRef):
 TOOL = {"name": "get_person_dialogue", "args": GetPersonDialogueArgs}
 
 
+@memory_read
 def get_person_dialogue(
     video_path: str | None = None,
     namespace: str | None = None,
